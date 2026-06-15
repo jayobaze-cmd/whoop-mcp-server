@@ -45,21 +45,29 @@ Built using the [Whoop Developer API v2](https://developer.whoop.com/docs/introd
 5. Add a volume mounted at `/data` for persistent SQLite storage
 6. Deploy!
 
-### 3. Authorize with Whoop
+### 3. Connect to Claude
 
 1. Visit `https://your-app.railway.app/health` to verify it's running
-2. The first time you use the `get_auth_url` tool in Claude, it will provide an authorization link
-3. Visit the link, log in to Whoop, and authorize the app
-4. You'll be redirected back and the initial 90-day sync will begin
-
-### 4. Connect to Claude
-
-1. Go to Claude.ai settings → Connectors
-2. Click "Add custom connector"
-3. Enter:
+2. Go to Claude.ai settings → Connectors
+3. Click "Add custom connector"
+4. Enter:
    - **Name**: Whoop
    - **Remote MCP server URL**: `https://your-app.railway.app/mcp`
-4. Use it in any chat!
+5. Claude will open the authorization flow — log in to Whoop and approve access
+6. The initial 90-day sync begins automatically. Use it in any chat!
+
+The server implements the MCP authorization spec: OAuth 2.0 discovery metadata (RFC 8414 / RFC 9728), dynamic client registration (RFC 7591), and an authorization-code flow with PKCE that chains into Whoop's own OAuth login. Claude never sees your Whoop credentials or tokens — it receives a separate bearer token issued by this server.
+
+### OAuth Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/.well-known/oauth-protected-resource` | Protected resource metadata (RFC 9728) |
+| `/.well-known/oauth-authorization-server` | Authorization server metadata (RFC 8414) |
+| `POST /register` | Dynamic client registration (RFC 7591) |
+| `GET /authorize` | Authorization endpoint (redirects to Whoop login) |
+| `POST /token` | Token endpoint (authorization_code + refresh_token, PKCE S256) |
+| `GET /callback` | Whoop OAuth callback (both connector and manual flows) |
 
 ## Local Development
 
@@ -89,6 +97,8 @@ npm run dev
 | `DB_PATH` | SQLite database path | `./whoop.db` |
 | `PORT` | HTTP server port | `3000` |
 | `MCP_MODE` | `http` for remote, `stdio` for local | `http` |
+| `PUBLIC_BASE_URL` | Public URL used in OAuth metadata (defaults to the request host) | — |
+| `MCP_ALLOW_UNAUTHENTICATED` | Set to `true` to disable bearer auth on `/mcp` | `false` |
 
 ## Architecture
 

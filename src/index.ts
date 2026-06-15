@@ -2,10 +2,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { McpOAuth } from './oauth.js';
 
 interface ToolArguments {
 	days?: number;
@@ -19,7 +20,11 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
+	publicBaseUrl: process.env.PUBLIC_BASE_URL,
+	requireAuth: process.env.MCP_ALLOW_UNAUTHENTICATED !== 'true',
 };
+
+const WHOOP_SCOPES = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
 
 const db = new WhoopDatabase(config.dbPath);
 const client = new WhoopClient({
@@ -311,8 +316,7 @@ function createMcpServer(): Server {
 				}
 
 				case 'get_auth_url': {
-					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
-					const url = client.getAuthorizationUrl(scopes);
+					const url = client.getAuthorizationUrl(WHOOP_SCOPES);
 					return {
 						content: [{
 							type: 'text',
@@ -340,11 +344,95 @@ async function main(): Promise<void> {
 		await server.connect(transport);
 		process.stderr.write('Whoop MCP server running on stdio\n');
 	} else {
+		const oauth = new McpOAuth(db);
+		setInterval(() => oauth.cleanup(), 5 * 60 * 1000);
+
 		const app = express();
+		app.set('trust proxy', true);
 		app.use(express.json());
+		app.use(express.urlencoded({ extended: false }));
+
+		// Minimal CORS so browser-based MCP clients (e.g. MCP Inspector) can connect.
+		app.use((req: Request, res: Response, next: NextFunction) => {
+			res.setHeader('Access-Control-Allow-Origin', '*');
+			res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+			res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version');
+			res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id, WWW-Authenticate');
+			if (req.method === 'OPTIONS') {
+				res.status(204).end();
+				return;
+			}
+			next();
+		});
+
+		const getBaseUrl = (req: Request): string => {
+			const base = config.publicBaseUrl ?? `${req.protocol}://${req.get('host')}`;
+			return base.replace(/\/+$/, '');
+		};
+
+		// OAuth discovery metadata (RFC 9728 / RFC 8414). Claude.ai probes both the
+		// bare paths and the /mcp-suffixed variants.
+		app.get(
+			['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'],
+			(req: Request, res: Response) => {
+				res.json(oauth.protectedResourceMetadata(getBaseUrl(req)));
+			}
+		);
+
+		app.get(
+			['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp'],
+			(req: Request, res: Response) => {
+				res.json(oauth.authorizationServerMetadata(getBaseUrl(req)));
+			}
+		);
+
+		// Dynamic client registration (RFC 7591).
+		app.post('/register', (req: Request, res: Response) => {
+			oauth.handleRegister(req, res);
+		});
+
+		// Authorization endpoint: validates the client request, then chains into the
+		// Whoop OAuth flow. Whoop redirects back to /callback, which completes both legs.
+		app.get('/authorize', (req: Request, res: Response) => {
+			const stateKey = oauth.beginAuthorization(req, res);
+			if (!stateKey) return;
+			res.redirect(client.getAuthorizationUrl(WHOOP_SCOPES, stateKey));
+		});
+
+		app.post('/token', (req: Request, res: Response) => {
+			oauth.handleToken(req, res);
+		});
 
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
+			const state = req.query.state as string | undefined;
+			const oauthError = req.query.error as string | undefined;
+
+			// Connector flow: this callback belongs to a pending /authorize request,
+			// so finish the Whoop leg and redirect back to the MCP client.
+			const pending = state ? oauth.takePending(state) : undefined;
+			if (pending) {
+				if (oauthError) {
+					res.redirect(oauth.buildErrorRedirect(pending, 'access_denied', `Whoop authorization failed: ${oauthError}`));
+					return;
+				}
+				if (!code) {
+					res.redirect(oauth.buildErrorRedirect(pending, 'invalid_request', 'Missing authorization code from Whoop'));
+					return;
+				}
+
+				try {
+					const tokens = await client.exchangeCodeForTokens(code);
+					db.saveTokens(tokens);
+					sync.syncDays(90).catch(() => {});
+					res.redirect(oauth.buildSuccessRedirect(pending));
+				} catch {
+					res.redirect(oauth.buildErrorRedirect(pending, 'server_error', 'Failed to exchange Whoop authorization code'));
+				}
+				return;
+			}
+
+			// Legacy flow: manual authorization via the get_auth_url tool.
 			if (!code) {
 				res.status(400).send('Missing authorization code');
 				return;
@@ -365,9 +453,41 @@ async function main(): Promise<void> {
 		});
 
 		app.all('/mcp', async (req: Request, res: Response) => {
+			if (config.requireAuth) {
+				const authResult = oauth.validateBearer(req.headers.authorization);
+				if (authResult !== 'ok') {
+					const resourceMetadataUrl = `${getBaseUrl(req)}/.well-known/oauth-protected-resource`;
+					const challenge = authResult === 'invalid'
+						? `Bearer error="invalid_token", error_description="Access token is invalid or expired", resource_metadata="${resourceMetadataUrl}"`
+						: `Bearer resource_metadata="${resourceMetadataUrl}"`;
+					res.status(401)
+						.set('WWW-Authenticate', challenge)
+						.json({ error: 'unauthorized', error_description: 'Valid bearer token required' });
+					return;
+				}
+			}
+
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
-			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
+			// Unknown session (e.g. after a server restart): 404 tells the client to
+			// re-initialize instead of the transport rejecting the request with a 400.
+			if (sessionId && !transports.has(sessionId)) {
+				res.status(404).json({
+					jsonrpc: '2.0',
+					error: { code: -32001, message: 'Session not found' },
+					id: null,
+				});
+				return;
+			}
+
+			// Some clients omit one of the required Accept values; the transport would
+			// reject those with a 406, so normalize before handing the request off.
+			const accept = req.headers.accept ?? '';
+			if (!accept.includes('application/json') || !accept.includes('text/event-stream')) {
+				req.headers.accept = 'application/json, text/event-stream';
+			}
+
+			if (req.method === 'DELETE' && sessionId) {
 				const session = transports.get(sessionId)!;
 				await session.transport.close();
 				transports.delete(sessionId);
@@ -375,26 +495,24 @@ async function main(): Promise<void> {
 				return;
 			}
 
+			if (sessionId) {
+				const session = transports.get(sessionId)!;
+				session.lastAccess = Date.now();
+				await session.transport.handleRequest(req, res, req.body);
+				return;
+			}
+
 			if (req.method === 'POST') {
-				let transport: StreamableHTTPServerTransport;
+				const transport = new StreamableHTTPServerTransport({
+					sessionIdGenerator: () => crypto.randomUUID(),
+					onsessioninitialized: newSessionId => {
+						transports.set(newSessionId, { transport, lastAccess: Date.now() });
+					},
+				});
 
-				if (sessionId && transports.has(sessionId)) {
-					const session = transports.get(sessionId)!;
-					session.lastAccess = Date.now();
-					transport = session.transport;
-				} else {
-					transport = new StreamableHTTPServerTransport({
-						sessionIdGenerator: () => crypto.randomUUID(),
-						onsessioninitialized: newSessionId => {
-							transports.set(newSessionId, { transport, lastAccess: Date.now() });
-						},
-					});
-
-					const server = createMcpServer();
-					await server.connect(transport);
-				}
-
-				await transport.handleRequest(req, res);
+				const server = createMcpServer();
+				await server.connect(transport);
+				await transport.handleRequest(req, res, req.body);
 				return;
 			}
 

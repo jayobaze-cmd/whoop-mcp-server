@@ -47,6 +47,29 @@ interface StrainTrendRow {
 	calories: number;
 }
 
+interface OAuthClientRow {
+	client_id: string;
+	client_secret: string | null;
+	redirect_uris: string;
+	client_name: string | null;
+	token_endpoint_auth_method: string;
+}
+
+export interface OAuthClient {
+	clientId: string;
+	clientSecret: string | null;
+	redirectUris: string[];
+	clientName: string | null;
+	tokenEndpointAuthMethod: string;
+}
+
+export interface OAuthTokenRow {
+	token_hash: string;
+	token_type: string;
+	client_id: string;
+	expires_at: number;
+}
+
 export class WhoopDatabase {
 	private db: Database.Database;
 
@@ -143,6 +166,25 @@ export class WhoopDatabase {
 				synced_at TEXT DEFAULT CURRENT_TIMESTAMP
 			);
 
+			CREATE TABLE IF NOT EXISTS oauth_clients (
+				client_id TEXT PRIMARY KEY,
+				client_secret TEXT,
+				redirect_uris TEXT NOT NULL,
+				client_name TEXT,
+				token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP
+			);
+
+			CREATE TABLE IF NOT EXISTS oauth_tokens (
+				token_hash TEXT PRIMARY KEY,
+				token_type TEXT NOT NULL,
+				client_id TEXT NOT NULL,
+				expires_at INTEGER NOT NULL,
+				created_at TEXT DEFAULT CURRENT_TIMESTAMP
+			);
+
+			CREATE INDEX IF NOT EXISTS idx_oauth_tokens_expires ON oauth_tokens(expires_at);
+
 			CREATE INDEX IF NOT EXISTS idx_cycles_start ON cycles(start_time);
 			CREATE INDEX IF NOT EXISTS idx_recovery_created ON recovery(created_at);
 			CREATE INDEX IF NOT EXISTS idx_sleep_start ON sleep(start_time);
@@ -179,6 +221,44 @@ export class WhoopDatabase {
 			refresh_token: refreshToken,
 			expires_at: row.expires_at,
 		};
+	}
+
+	saveOAuthClient(client: OAuthClient): void {
+		this.db.prepare(`
+			INSERT OR REPLACE INTO oauth_clients (client_id, client_secret, redirect_uris, client_name, token_endpoint_auth_method, created_at)
+			VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`).run(client.clientId, client.clientSecret, JSON.stringify(client.redirectUris), client.clientName, client.tokenEndpointAuthMethod);
+	}
+
+	getOAuthClient(clientId: string): OAuthClient | null {
+		const row = this.db.prepare('SELECT * FROM oauth_clients WHERE client_id = ?').get(clientId) as OAuthClientRow | undefined;
+		if (!row) return null;
+		return {
+			clientId: row.client_id,
+			clientSecret: row.client_secret,
+			redirectUris: JSON.parse(row.redirect_uris) as string[],
+			clientName: row.client_name,
+			tokenEndpointAuthMethod: row.token_endpoint_auth_method,
+		};
+	}
+
+	saveOAuthToken(tokenHash: string, tokenType: 'access' | 'refresh', clientId: string, expiresAt: number): void {
+		this.db.prepare(`
+			INSERT OR REPLACE INTO oauth_tokens (token_hash, token_type, client_id, expires_at, created_at)
+			VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+		`).run(tokenHash, tokenType, clientId, expiresAt);
+	}
+
+	getOAuthToken(tokenHash: string): OAuthTokenRow | null {
+		return this.db.prepare('SELECT * FROM oauth_tokens WHERE token_hash = ?').get(tokenHash) as OAuthTokenRow | undefined ?? null;
+	}
+
+	deleteOAuthToken(tokenHash: string): void {
+		this.db.prepare('DELETE FROM oauth_tokens WHERE token_hash = ?').run(tokenHash);
+	}
+
+	deleteExpiredOAuthTokens(now: number): void {
+		this.db.prepare('DELETE FROM oauth_tokens WHERE expires_at < ?').run(now);
 	}
 
 	getSyncState(): { lastSyncAt: string | null; oldestDate: string | null; newestDate: string | null } {
