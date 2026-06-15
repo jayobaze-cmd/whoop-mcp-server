@@ -102,29 +102,44 @@ npm run dev
 
 ## Architecture
 
+**The live server runs on Railway, not on your local machine.** Your local
+clone of this repo is the *deploy source* — you edit it, commit, and push, and
+Railway rebuilds and runs it. The running server, your Whoop tokens, and ~90
+days of synced health data all live in a SQLite database on Railway's `/data`
+volume. There is no local database or local copy of your data.
+
 ```
+  Claude.ai (chat / custom connector)
+        │   HTTPS + OAuth → https://<your-app>.up.railway.app/mcp
+        ▼
 ┌─────────────────────────────────────────────────┐
-│              Whoop MCP Server                   │
-│                                                 │
-│  ┌─────────────┐      ┌──────────────────┐    │
-│  │ MCP Server  │◄────►│  SQLite Database │    │
-│  │ (HTTP)      │      │  - cycles        │    │
-│  └─────────────┘      │  - recovery      │    │
-│         │             │  - sleep         │    │
-│         │             │  - workouts      │    │
-│         ▼             │  - tokens        │    │
-│  ┌─────────────┐      └──────────────────┘    │
-│  │ Whoop API   │                               │
-│  │ Client      │                               │
-│  └─────────────┘                               │
+│            RAILWAY  (the live server)            │
+│                                                  │
+│  ┌─────────────┐      ┌──────────────────────┐  │
+│  │ MCP Server  │◄────►│  SQLite (/data volume)│  │
+│  │ + OAuth     │      │  - cycles / recovery  │  │
+│  │ (HTTP)      │      │  - sleep / workouts   │  │
+│  └─────────────┘      │  - whoop tokens       │  │
+│         │             │  - oauth clients/tokens│  │
+│         ▼             └──────────────────────┘  │
+│  ┌─────────────┐                                 │
+│  │ Whoop API   │ → api.prod.whoop.com            │
+│  │ Client      │                                 │
+│  └─────────────┘                                 │
 └─────────────────────────────────────────────────┘
-         │
-         ▼
+        ▲
+        │  git push  (rebuild & redeploy)
 ┌─────────────────────────────────────────────────┐
-│  Claude.ai (Custom Connector)                   │
-│  "Hey, what's my recovery today?"               │
+│  Local repo (C:\...\whoop-mcp-server)            │
+│  Source code only — does NOT run, has NO data.   │
+│  edit → git commit → git push → Railway deploys  │
 └─────────────────────────────────────────────────┘
 ```
+
+**Building automation on top of this?** Reach the data the same way Claude
+does — call the MCP tools through the Railway URL — or run the new job *inside*
+the Railway service so it shares the same database and Whoop tokens. Don't
+assume a local database or local Whoop credentials; they only exist on Railway.
 
 ## API Endpoints Used
 
